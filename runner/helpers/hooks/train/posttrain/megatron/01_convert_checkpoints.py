@@ -24,6 +24,7 @@ PRIMUS_ROOT = Path(__file__).resolve().parents[6]
 sys.path.insert(0, str(PRIMUS_ROOT))
 
 from primus.core.config.primus_config import get_module_config, load_primus_config
+from primus.core.utils.arg_utils import parse_cli_overrides
 
 
 def _is_rank_0() -> bool:
@@ -136,12 +137,14 @@ def read_native_opts(config_file: str) -> dict:
     return opts
 
 
-def read_experiment_checkpoint_settings(config_file: str) -> dict:
+def read_experiment_checkpoint_settings(config_file: str, argv=None) -> dict:
     """Read the experiment's parallel layout and checkpoint format.
 
     Returns ``{"tp", "pp", "ep", "ckpt_format"}``: the tensor / pipeline /
     expert parallel sizes (default 1) and ``ckpt_format`` (default
-    ``torch_dist``, Megatron's default) the fine-tune runs with.
+    ``torch_dist``, Megatron's default) the fine-tune runs with. ``argv`` is the
+    hook's command line: the training run applies its overrides (e.g.
+    ``--tensor_model_parallel_size 2``) to the config, and so does this.
     """
     cfg = load_primus_config(Path(config_file), None)
     names = {
@@ -164,6 +167,16 @@ def read_experiment_checkpoint_settings(config_file: str) -> dict:
             if value is not None:
                 settings[key] = str(value) if key == "ckpt_format" else int(value)
         break
+
+    if argv:
+        # the hook group and name (``train posttrain``) come before the overrides
+        tokens = list(argv)
+        first = next((i for i, t in enumerate(tokens) if t.startswith("--") or "=" in t), len(tokens))
+        overrides = parse_cli_overrides(tokens[first:])
+        for name, key in names.items():
+            if overrides.get(name) is not None:
+                log_info(f"command line overrides {name}: {settings[key]} -> {overrides[name]}")
+                settings[key] = str(overrides[name]) if key == "ckpt_format" else int(overrides[name])
 
     return settings
 
@@ -413,10 +426,13 @@ def _emit_native_checkpoint_args(megatron_path: Path):
 def _resolve_native_ckpt_format(requested: str | None, experiment: dict) -> str:
     """Pick the format the native converter writes, or exit with the reason.
 
-    Unset (``requested is None``): the experiment's own ``ckpt_format`` when the
-    converter can write it (``torch_dist`` by default; ``torch`` for experiments
-    that ask for it, as before), else ``torch_dist``. Then two layouts are
-    refused, because Megatron cannot load them:
+    The experiment's ``ckpt_format`` must be one the converter writes
+    (``CKPT_FORMATS``). A run in another format (``torch_dcp``, ``fsdp_dtensor``)
+    does not load the converted checkpoint; with ``auto_detect_ckpt_format`` a
+    ``torch_dcp`` run even starts from random weights without an error. Unset
+    (``requested is None``), the converter writes the experiment's format
+    (``torch_dist`` by default; ``torch`` for experiments that ask for it, as
+    before). Then two layouts are refused, because Megatron cannot load them:
 
     * ``torch`` at any TP / PP / EP other than 1: a legacy checkpoint is not
       resharded on load.
@@ -426,10 +442,14 @@ def _resolve_native_ckpt_format(requested: str | None, experiment: dict) -> str:
     from primus.backends.megatron.checkpoint import native_convert_common as common
 
     run_format = experiment.get("ckpt_format", "torch_dist")
-    if requested is None:
-        ckpt_format = run_format if run_format in common.CKPT_FORMATS else common.DEFAULT_CKPT_FORMAT
-    else:
-        ckpt_format = requested
+    if run_format not in common.CKPT_FORMATS:
+        log_error(
+            f"ckpt_format: {run_format} is not a format the native converter writes {common.CKPT_FORMATS}. "
+            "Set ckpt_format: torch_dist (Megatron reshards it on load) and fine-tune without FSDP "
+            "(use_torch_fsdp2, use_megatron_fsdp): an FSDP run cannot load a converted checkpoint."
+        )
+        sys.exit(1)
+    ckpt_format = run_format if requested is None else requested
     if ckpt_format not in common.CKPT_FORMATS:
         log_error(f"native_ckpt_format: {ckpt_format!r} is not supported; use one of {common.CKPT_FORMATS}")
         sys.exit(1)
@@ -667,7 +687,7 @@ def main():
         _native_main(
             hf_path,
             native_opts,
-            read_experiment_checkpoint_settings(config_file),
+            read_experiment_checkpoint_settings(config_file, unknown_args),
             config_file=config_file,
             argv=unknown_args,
         )

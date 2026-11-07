@@ -69,22 +69,24 @@ def _write_torch(ckpt_dir: Path):
 def fake_save_checkpoint(monkeypatch):
     """Stand-in ``megatron.training.checkpointing.save_checkpoint``.
 
-    Writes what Megatron writes for ``margs.ckpt_format`` at ``margs.iteration``:
-    ``iter_XXXXXXX/metadata.json`` for torch_dist, ``iter_XXXXXXX/mp_rank_00`` for
-    torch, plus the tracker file.
+    Writes what Megatron writes for ``margs.ckpt_format``: ``metadata.json`` for
+    torch_dist, ``mp_rank_00`` for torch, in ``release/`` when ``release`` is set
+    and ``iter_XXXXXXX/`` otherwise, then the tracker file.
     """
     calls = []
     state = {}
 
-    def save_checkpoint(iteration, models, optimizer, scheduler, num_floating_point_operations_so_far):
+    def save_checkpoint(
+        iteration, models, optimizer, scheduler, num_floating_point_operations_so_far, release=False
+    ):
         margs = state["margs"]
-        iter_dir = Path(margs.save) / f"iter_{iteration:07d}"
+        ckpt_dir = Path(margs.save) / ("release" if release else f"iter_{iteration:07d}")
         if margs.ckpt_format == "torch_dist":
-            _write_torch_dist(iter_dir)
+            _write_torch_dist(ckpt_dir)
         else:
-            _write_torch(iter_dir)
-        (Path(margs.save) / common.TRACKER_FILENAME).write_text(str(iteration))
-        calls.append((iteration, margs.ckpt_format))
+            _write_torch(ckpt_dir)
+        (Path(margs.save) / common.TRACKER_FILENAME).write_text("release" if release else str(iteration))
+        calls.append((iteration, margs.ckpt_format, release))
 
     checkpointing = _package("megatron.training.checkpointing", save_checkpoint=save_checkpoint)
     monkeypatch.setitem(sys.modules, "megatron", _package("megatron"))
@@ -123,7 +125,7 @@ def test_torch_dist_save_uses_release_layout(tmp_path, fake_save_checkpoint):
     state, calls = fake_save_checkpoint
     out = _save(tmp_path, state, "torch_dist")
 
-    assert calls == [(1, "torch_dist")]
+    assert calls == [(1, "torch_dist", True)]
     assert (out / common.TRACKER_FILENAME).read_text() == "release"
     assert (out / "release" / "metadata.json").is_file()
     assert not (out / "iter_0000001").exists()
@@ -134,19 +136,36 @@ def test_legacy_torch_save_keeps_per_rank_layout(tmp_path, fake_save_checkpoint)
     state, calls = fake_save_checkpoint
     out = _save(tmp_path, state, "torch")
 
-    assert calls == [(1, "torch")]
+    assert calls == [(1, "torch", False)]
     assert (out / common.TRACKER_FILENAME).read_text() == "1"
     assert (out / "iter_0000001" / "mp_rank_00" / "model_optim_rng.pt").is_file()
     assert not (out / "release").exists()
     assert common.saved_ckpt_format(str(out)) == "torch"
 
 
-def test_torch_dist_save_refuses_existing_release_dir(tmp_path, fake_save_checkpoint):
+def test_torch_dist_save_refuses_a_finished_release_dir(tmp_path, fake_save_checkpoint):
     state, calls = fake_save_checkpoint
-    (tmp_path / "out" / "release").mkdir(parents=True)
+    _write_torch_dist(tmp_path / "out" / "release")
+    (tmp_path / "out" / common.TRACKER_FILENAME).write_text("release")
     with pytest.raises(RuntimeError, match="already has a 'release' directory"):
         _save(tmp_path, state, "torch_dist")
     assert calls == []
+
+
+def test_torch_dist_save_sets_aside_an_interrupted_release_dir(tmp_path, fake_save_checkpoint):
+    """A save that died part-way left ``release/`` and no tracker (Megatron writes it
+    last). The next conversion moves that directory aside instead of refusing."""
+    state, calls = fake_save_checkpoint
+    (tmp_path / "out" / "release").mkdir(parents=True)
+    (tmp_path / "out" / "release" / "__0_0.distcp").write_bytes(b"partial")
+
+    out = _save(tmp_path, state, "torch_dist")
+
+    assert calls == [(1, "torch_dist", True)]
+    (aside,) = out.glob("release.incomplete-*")
+    assert (aside / "__0_0.distcp").read_bytes() == b"partial"
+    assert (out / "release" / "metadata.json").is_file()
+    assert common.saved_ckpt_format(str(out)) == "torch_dist"
 
 
 def test_incomplete_mapping_saves_nothing(tmp_path, fake_save_checkpoint):
@@ -224,7 +243,9 @@ def test_failed_write_names_directory_and_free_space(
     "unexpected pos" (or a CheckpointException, which is a BaseException)."""
     state, _ = fake_save_checkpoint
 
-    def save_checkpoint(iteration, models, optimizer, scheduler, num_floating_point_operations_so_far):
+    def save_checkpoint(
+        iteration, models, optimizer, scheduler, num_floating_point_operations_so_far, release=False
+    ):
         torch.save(models[0].weight, _DiskFullStream(room=_ROOM_BEFORE_DATA))
 
     monkeypatch.setattr(sys.modules["megatron.training.checkpointing"], "save_checkpoint", save_checkpoint)
@@ -327,7 +348,6 @@ def _experiment(tp=1, pp=1, ep=1, ckpt_format="torch_dist"):
         (None, _experiment(tp=2), "torch_dist"),
         (None, _experiment(pp=2, ep=8), "torch_dist"),
         (None, _experiment(ckpt_format="torch"), "torch"),  # TP1 legacy experiments: unchanged
-        (None, _experiment(ckpt_format="torch_dcp"), "torch_dist"),
         ("torch_dist", _experiment(tp=4), "torch_dist"),
         ("torch", _experiment(), "torch"),
     ],
@@ -344,6 +364,10 @@ def test_resolve_format(requested, experiment, expected):
         ("torch", _experiment(ep=8), "cannot be loaded at TP=1 PP=1 EP=8"),
         ("torch_dist", _experiment(ckpt_format="torch"), "set ckpt_format: torch_dist"),
         ("zarr", _experiment(), "is not supported"),
+        # a run format the converter does not write
+        (None, _experiment(ckpt_format="torch_dcp"), "ckpt_format: torch_dcp is not a format"),
+        (None, _experiment(ckpt_format="fsdp_dtensor"), "ckpt_format: fsdp_dtensor is not a format"),
+        ("torch_dist", _experiment(ckpt_format="torch_dcp"), "fine-tune without FSDP"),
     ],
 )
 def test_resolve_format_refuses_unloadable(requested, experiment, message, capsys):
@@ -371,6 +395,33 @@ def test_read_experiment_checkpoint_settings(monkeypatch):
         "ep": 1,
         "ckpt_format": "torch_dist",
     }
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["train", "posttrain", "--tensor_model_parallel_size", "2", "expert_model_parallel_size=8"],
+        ["train", "posttrain", "tensor_model_parallel_size=2", "--expert_model_parallel_size=8"],
+    ],
+)
+def test_read_experiment_checkpoint_settings_applies_command_line_overrides(monkeypatch, capsys, argv):
+    """The training run applies the command line's overrides to the config, so the
+    layout and format the conversion is checked against include them."""
+    monkeypatch.setenv("RANK", "0")
+    params = SimpleNamespace(tensor_model_parallel_size=1, ckpt_format="torch")
+    monkeypatch.setattr(hook, "load_primus_config", lambda path, cli: SimpleNamespace())
+    monkeypatch.setattr(
+        hook,
+        "get_module_config",
+        lambda cfg, name: SimpleNamespace(params=params) if name == "post_trainer" else None,
+    )
+
+    settings = hook.read_experiment_checkpoint_settings("exp.yaml", argv + ["--ckpt_format", "torch_dist"])
+
+    assert settings == {"tp": 2, "pp": 1, "ep": 8, "ckpt_format": "torch_dist"}
+    out = capsys.readouterr().out
+    assert "command line overrides tensor_model_parallel_size: 1 -> 2" in out
+    assert "invalid override" not in out
 
 
 # ---------------------------------------------------------------------------
