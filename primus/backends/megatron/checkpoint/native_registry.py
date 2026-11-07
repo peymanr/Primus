@@ -170,8 +170,24 @@ class NativeFamily:
     * ``wait(megatron_path, done_file, lock_file, node_rank)``: how a node
       other than node 0 waits for the conversion; default: the hook's
       ``wait_for_conversion``.
+    * ``decline(cfg) -> str | None``: a reason the family does not convert this
+      HF ``config.json`` dict, or None. A family that declines a config is
+      skipped when the config is looked up, as if it were not registered (so
+      the config takes the route it had without the family, e.g. another
+      family or Megatron-Bridge). Called during detection, so it must stay
+      light (it reads the config only; no torch / transformers imports of its
+      own). It returns None or a non-empty ``str``; raising
+      ``NativeConvertRefused`` is a decline with its message. A ``decline`` that
+      fails (it cannot be imported, raises anything else, or returns another
+      value) is a ``[WARNING]`` and does not decline: the family stays selected,
+      and the registry's prepare step (``hook("prepare")``) runs ``decline``
+      again and refuses the config with the error (``NativeConvertRefused``)
+      before the family's own ``prepare``. This fails closed on purpose: a
+      broken hook stops the conversion with its error instead of silently
+      changing the route (e.g. to Megatron-Bridge).
 
-    Hooks are callables or ``"module:function"`` strings (imported on use).
+    Hooks are callables or ``"module:function"`` strings, imported on use
+    (registration checks only the string's shape).
     """
 
     name: str
@@ -185,12 +201,21 @@ class NativeFamily:
     dtype_from_config: Hook = None
     prepare: Hook = None
     wait: Hook = None
+    decline: Hook = None
 
     def converter_module(self):
         return importlib.import_module(self.converter)
 
     def hook(self, which: str) -> Callable | None:
-        """The ``which`` hook (``prepare`` / ``wait`` / ``dtype_from_config``) as a callable."""
+        """The ``which`` hook (``prepare`` / ``wait`` / ``dtype_from_config`` / ``decline``) as a callable.
+
+        For a family with ``decline``, ``prepare`` is the registry's step and is
+        never None (the decline check is a prepare step of its own): it refuses a
+        config ``decline`` declines or cannot judge, and only then resolves
+        (imports) and runs the family's own ``prepare``, if any. So a declined
+        config never imports the family's prepare module."""
+        if which == "prepare" and self.decline is not None:
+            return _refusing_prepare(self)
         return resolve_hook(getattr(self, which))
 
 
@@ -215,6 +240,75 @@ def resolve_hook(hook: Hook) -> Callable | None:
     return getattr(importlib.import_module(module), attr)
 
 
+def _check_hook_shape(family: NativeFamily, which: str) -> None:
+    """A hook string must read ``"module:function"``; it is not imported here (hook
+    modules may import torch and model code, which registration must not run)."""
+    hook = getattr(family, which)
+    if hook is None or callable(hook):
+        return
+    module, sep, attr = hook.partition(":") if isinstance(hook, str) else ("", "", "")
+    if not sep or not module or not attr:
+        raise ValueError(f"native family {family.name!r}: {which} hook {hook!r} is not 'module:function'")
+
+
+class _DeclineHookError(Exception):
+    """The decline hook could not judge a config: it failed to import, raised, or
+    returned something other than None or a non-empty string."""
+
+
+def _run_decline(family: NativeFamily, cfg: dict):
+    """The reason ``family``'s ``decline`` hook gives for ``cfg``, or None.
+
+    A ``NativeConvertRefused`` the hook raises propagates unchanged (callers treat it
+    as a decline with its message). Any other exception, or a result that is not
+    None or a non-empty ``str``, raises ``_DeclineHookError`` (the hook cannot judge
+    the config)."""
+    try:
+        decline = family.hook("decline")
+        result = decline(cfg) if decline else None
+    except NativeConvertRefused:
+        raise
+    except Exception as e:  # noqa: BLE001 - reported by the callers
+        raise _DeclineHookError(f"{type(e).__name__}: {e}") from e
+    if result is None:
+        return None
+    if isinstance(result, str) and result:
+        return result
+    raise _DeclineHookError(f"it returned {result!r}, not None or a non-empty reason string")
+
+
+def _refusing_prepare(family: NativeFamily) -> Callable:
+    """``family``'s prepare step behind its ``decline`` hook: a config ``decline``
+    declines, or one it cannot judge (``_DeclineHookError``), is refused
+    (``NativeConvertRefused``) before the family's own ``prepare`` (may be None) is
+    resolved and run. Fails closed: a broken hook stops the conversion with its error
+    instead of a silent change of route. A ``NativeConvertRefused`` the hook raises
+    passes through unchanged."""
+
+    def refusing_prepare(ctx):
+        try:
+            reason = _run_decline(family, ctx.hf_config)
+        except _DeclineHookError as e:
+            raise NativeConvertRefused(
+                f"native converter family {family.name!r}: its decline hook failed on the HF model at "
+                f"{ctx.hf_path} ({e}), so it cannot tell whether it converts it"
+            ) from e
+        if reason:
+            raise NativeConvertRefused(
+                f"native converter family {family.name!r} does not convert the HF model at {ctx.hf_path}: {reason}"
+            )
+        try:  # imported only for a config the family takes
+            prepare = resolve_hook(family.prepare)
+        except Exception as e:  # noqa: BLE001 - a refusal with the reason, not a traceback
+            raise NativeConvertRefused(
+                f"native converter family {family.name!r}: its prepare hook {family.prepare!r} "
+                f"does not load ({type(e).__name__}: {e})"
+            ) from e
+        return prepare(ctx) if prepare is not None else None
+
+    return refusing_prepare
+
+
 def register_native_family(family: NativeFamily) -> NativeFamily:
     """Register ``family``; returns it.
 
@@ -237,6 +331,8 @@ def register_native_family(family: NativeFamily) -> NativeFamily:
     for opt in family.options:
         if not isinstance(opt, NativeOption):
             raise TypeError(f"native family {family.name!r}: options must be NativeOption, got {opt!r}")
+    for which in ("dtype_from_config", "prepare", "wait", "decline"):
+        _check_hook_shape(family, which)
     _FAMILIES[family.name] = family
     for n in names:
         _NAMES[n] = family.name
@@ -250,6 +346,8 @@ def unregister_native_family(name: str) -> None:
         return
     for key in [k for k, v in _NAMES.items() if v == name]:
         del _NAMES[key]
+    for reported in [r for r in _DECLINE_REPORTED if r[0] == name]:
+        _DECLINE_REPORTED.discard(reported)
 
 
 def load_family_modules() -> dict:
@@ -304,6 +402,12 @@ def supported_text() -> str:
 def unknown_model_text(hf_path: str) -> str:
     """Why no native converter matches the model at ``hf_path``, with the supported families."""
     text = f"no native converter matches the HF model at {hf_path} ({supported_text()})"
+    try:
+        cfg = read_config(hf_path)
+    except (OSError, ValueError):
+        cfg = None
+    for note in _decline_notes(cfg):
+        text += f"; {note}"
     if _LOAD_ERRORS:
         text += "; family modules that failed to import: " + ", ".join(sorted(_LOAD_ERRORS))
     return text
@@ -317,29 +421,107 @@ def read_config(hf_path: str) -> dict | None:
         return json.load(f)
 
 
+# (family name, message) pairs already printed on stderr: each distinct message is printed
+# once per process (the message names the reason, not the checkpoint). Cleared for a
+# family when it is unregistered.
+_DECLINE_REPORTED: set = set()
+
+
+def _config_family_names(cfg: dict) -> tuple:
+    """``(architectures, model_type)`` of an HF ``config.json`` dict as detection reads
+    them: a single architecture written as a string is one name."""
+    architectures = cfg.get("architectures", []) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    return list(architectures), cfg.get("model_type", "")
+
+
+def _candidate_families(cfg: dict) -> list:
+    """The families ``cfg`` can select, in the order detection tries them: each
+    architecture's family (in list order), then the ``model_type``'s family unless it
+    counts only for configs without architectures. No family twice."""
+    load_family_modules()
+    architectures, model_type = _config_family_names(cfg)
+    found = []
+    for arch in architectures:
+        name = _NAMES.get(str(arch).lower())
+        if name and _FAMILIES[name] not in found:
+            found.append(_FAMILIES[name])
+    name = _NAMES.get(str(model_type).lower())
+    if name:
+        family = _FAMILIES[name]
+        if not (architectures and family.model_type_needs_no_architectures) and family not in found:
+            found.append(family)
+    return found
+
+
+def _report_once(family: NativeFamily, message: str) -> None:
+    """Print ``message`` on stderr once per process, on rank 0 only (as the hook's
+    ``log_info``: ``RANK``, else ``NODE_RANK``, else 0)."""
+    if (family.name, message) not in _DECLINE_REPORTED:
+        _DECLINE_REPORTED.add((family.name, message))
+        if int(os.environ.get("RANK", os.environ.get("NODE_RANK", 0))) == 0:
+            print(message, file=sys.stderr)
+
+
+def _decline_check(family: NativeFamily, cfg: dict, *, report: bool = True) -> tuple:
+    """``(reason, error)`` of the family's ``decline`` hook for ``cfg``: ``reason`` when
+    it declines, ``error`` when the hook fails (``_run_decline``: it cannot be imported,
+    raises, or returns something other than None or a non-empty string).
+    The hook runs on every call (nothing is cached). With ``report``, each distinct
+    message is printed on stderr once per process (``_DECLINE_REPORTED``)."""
+    try:
+        reason = _run_decline(family, cfg)
+    except NativeConvertRefused as e:  # the hook's own way to decline
+        reason = str(e) or "refused"
+    except _DeclineHookError as e:  # a broken hook must not stop detection
+        error = str(e)
+        if report:
+            _report_once(
+                family,
+                f"[WARNING] native converter family {family.name!r}: its decline hook failed ({error}); "
+                "the family stays selected and its prepare step refuses the config.",
+            )
+        return None, error
+    if reason and report:
+        _report_once(
+            family,
+            f"[INFO] native converter family {family.name!r} does not convert this HF config: {reason}. "
+            "It is not selected for it (another native family may be; without one, the hook "
+            "uses Megatron-Bridge, or stops when native_ckpt_convert: true).",
+        )
+    return reason, None
+
+
+def _decline_notes(cfg) -> list:
+    """Why the families ``cfg`` can select did not take it: ``"<label> declines it:
+    <reason>"``, for this config only. (A family whose hook fails stays selected, so
+    it is never the reason no family matches.)"""
+    if not isinstance(cfg, dict):
+        return []
+    notes = []
+    for family in _candidate_families(cfg):
+        # the message itself says it; no detection line on this (error) path
+        reason, _ = _decline_check(family, cfg, report=False)
+        if reason:
+            notes.append(f"{family.label} declines it: {reason}")
+    return notes
+
+
 def family_for_config(cfg: dict) -> NativeFamily | None:
     """The family an HF ``config.json`` dict selects, or None.
 
     An architecture of a registered family wins (first match in the list);
     else the ``model_type``, unless that family's model types count only for
     configs without architectures. A single architecture written as a string is
-    one name.
+    one name. A family whose ``decline`` hook declines the config is skipped, as
+    if it were not registered.
     """
-    load_family_modules()
-    architectures = cfg.get("architectures", []) or []
-    if isinstance(architectures, str):
-        architectures = [architectures]
-    for arch in architectures:
-        name = _NAMES.get(str(arch).lower())
-        if name:
-            return _FAMILIES[name]
-    name = _NAMES.get(str(cfg.get("model_type", "")).lower())
-    if not name:
-        return None
-    family = _FAMILIES[name]
-    if architectures and family.model_type_needs_no_architectures:
-        return None
-    return family
+    for family in _candidate_families(cfg):
+        reason, _ = _decline_check(family, cfg)
+        if not reason:  # no hook, it converts the config, or the hook failed (warned)
+            return family
+    return None
 
 
 def detect_family(hf_path: str) -> NativeFamily | None:
