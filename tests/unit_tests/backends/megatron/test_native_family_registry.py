@@ -16,7 +16,6 @@ outside the core files is detected, dispatched and given its options, and that
 the messages list the registered families. Megatron is not needed.
 """
 
-import importlib.util
 import json
 import sys
 import types
@@ -34,19 +33,9 @@ from primus.backends.megatron.checkpoint.native_registry import (
     NativeOption,
     register_native_family,
 )
+from tests.posttrain_hook import load_hook
 
-_REPO = Path(__file__).resolve().parents[4]
-_HOOK = _REPO / "runner/helpers/hooks/train/posttrain/megatron/01_convert_checkpoints.py"
-
-
-def _load_hook():
-    spec = importlib.util.spec_from_file_location("native_registry_hook_under_test", _HOOK)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-hook = _load_hook()
+hook = load_hook("native_registry_hook_under_test")
 
 # The hook's table before the registry: every name must still select the same family.
 _TABLE_BEFORE_REGISTRY = {
@@ -69,6 +58,8 @@ _FAKE_CONVERTER = "native_registry_test_fake_converter"
 def isolated_registry(monkeypatch):
     """Each test sees the built-ins (plus what it registers); the registry is restored after."""
     saved = (dict(registry._FAMILIES), dict(registry._NAMES), dict(registry._LOAD_ERRORS), registry._loaded)
+    # per-test decline state (reported messages, failed hooks)
+    monkeypatch.setattr(registry, "_DECLINE_REPORTED", set())
     yield
     registry._FAMILIES.clear()
     registry._FAMILIES.update(saved[0])
@@ -149,7 +140,7 @@ def test_builtin_detection_order_and_misses(tmp_path):
     assert hook._detect_native_family(_hf(tmp_path, cfg, "a")) == "llama"
     cfg = {"architectures": ["Unknown"], "model_type": "qwen3_moe"}
     assert hook._detect_native_family(_hf(tmp_path, cfg, "b")) == "qwen3"
-    assert hook._detect_native_family(_hf(tmp_path, {"architectures": ["MistralForCausalLM"]}, "c")) is None
+    assert hook._detect_native_family(_hf(tmp_path, {"architectures": ["Gemma2ForCausalLM"]}, "c")) is None
     assert hook._detect_native_family(str(tmp_path / "no-config")) is None
 
 
@@ -205,16 +196,16 @@ def test_builtin_dispatch_unchanged(tmp_path, monkeypatch, no_megatron_setup):
 
 def test_unregistered_family_name_is_refused_not_sent_to_deepseek(tmp_path, no_megatron_setup):
     hf = _hf(tmp_path, {"architectures": ["LlamaForCausalLM"]})
-    with pytest.raises(ValueError, match=r"no native converter family 'mistral' \(supported: Qwen3"):
-        hook.native_convert_checkpoint(hf, "out", {"family": "mistral"})
+    with pytest.raises(ValueError, match=r"no native converter family 'gemma2' \(supported: Qwen3"):
+        hook.native_convert_checkpoint(hf, "out", {"family": "gemma2"})
 
 
 def test_unknown_model_message_lists_registered_families(tmp_path, monkeypatch, capsys):
     _toy_family()
-    hf = _hf(tmp_path, {"architectures": ["MistralForCausalLM"]})
+    hf = _hf(tmp_path, {"architectures": ["Gemma2ForCausalLM"]})
     with pytest.raises(ValueError) as e:
         hook.native_convert_checkpoint(hf, "out", {})
-    assert "Qwen3 dense/MoE, DeepSeek-V2/V3, Llama 2/3/3.1, Toy LM" in str(e.value)
+    assert "Qwen3 dense/MoE, DeepSeek-V2/V3, Llama 2/3/3.1" in str(e.value) and "Toy LM" in str(e.value)
 
     monkeypatch.setattr(hook, "get_checkpoint_config", lambda config: (hf, None))
     monkeypatch.setattr(
@@ -227,7 +218,7 @@ def test_unknown_model_message_lists_registered_families(tmp_path, monkeypatch, 
         hook.main()
     err = capsys.readouterr().err
     assert f"no native converter matches the HF model at {hf}" in err
-    assert "Llama 2/3/3.1, Toy LM" in err and "native_ckpt_convert: false" in err
+    assert "Llama 2/3/3.1" in err and "Toy LM" in err and "native_ckpt_convert: false" in err
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +445,256 @@ def test_prepare_refusal_exits_before_conversion(tmp_path, capsys, fake_converte
         )
     assert fake_converter == []
     assert "does not support" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# decline: a family that does not convert a config is skipped at detection
+# ---------------------------------------------------------------------------
+def test_declined_config_selects_no_family_and_takes_the_bridge_path(tmp_path, monkeypatch):
+    _toy_family(decline=lambda cfg: "windowed" if cfg.get("window") else None)
+    assert registry.family_for_config({"architectures": ["ToyForCausalLM"]}).name == "toy"
+    cfg = {"architectures": ["ToyForCausalLM"], "model_type": "toy", "window": 8}
+    assert registry.family_for_config(cfg) is None
+    assert registry.family_for_config({"model_type": "toy", "window": 8}) is None
+    hf = _hf(tmp_path, cfg)
+    assert hook._detect_native_family(hf) is None
+    assert "Toy LM declines it: windowed" in registry.unknown_model_text(hf)
+
+    # main(), native_ckpt_convert unset: the Megatron-Bridge path, as for an unknown model
+    monkeypatch.setattr(hook, "get_checkpoint_config", lambda config: (hf, None))
+    monkeypatch.setattr(
+        hook,
+        "read_native_opts",
+        lambda config: {"enabled": None, "dtype": None, "out": None, "ckpt_format": None},
+    )
+    monkeypatch.setattr(hook, "_native_main", lambda *a, **k: pytest.fail("native path taken"))
+
+    class _Bridge(Exception):
+        pass
+
+    def log_info(msg):
+        if "Megatron-Bridge conversion path" in msg:
+            raise _Bridge
+
+    monkeypatch.setattr(hook, "log_info", log_info)
+    monkeypatch.setattr(sys, "argv", ["hook", "--config", "/exp.yaml"])
+    with pytest.raises(_Bridge):
+        hook.main()
+
+
+@pytest.mark.parametrize("which", ["decline", "prepare", "wait", "dtype_from_config"])
+def test_malformed_hook_string_fails_registration(which):
+    """A hook string that is not 'module:function' fails registration, for every hook."""
+    with pytest.raises(ValueError, match=f"{which} hook 'nocolon' is not 'module:function'"):
+        _toy_family(**{which: "nocolon"})
+    assert "toy" not in registry._FAMILIES and "toyforcausallm" not in registry._NAMES
+
+
+def test_registration_does_not_import_hook_modules(tmp_path, monkeypatch):
+    """Registration checks only the hook strings' shape: the modules they name are
+    imported when the hooks run, not when the family registers."""
+    mod = tmp_path / "toy_hooks_xyz.py"
+    mod.write_text("def decline(cfg):\n    return None\n\ndef prepare(ctx):\n    return None\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("toy_hooks_xyz", None)
+    _toy_family(decline="toy_hooks_xyz:decline", prepare="toy_hooks_xyz:prepare")
+    assert "toy_hooks_xyz" not in sys.modules
+    assert registry.family_for_config({"architectures": ["ToyForCausalLM"]}).name == "toy"
+    assert "toy_hooks_xyz" in sys.modules  # imported on use (detection)
+    sys.modules.pop("toy_hooks_xyz", None)
+
+
+def _ctx(family, cfg):
+    return registry.ConvertContext(hf_path="/hf", hf_config=cfg, family=family, experiment={}, options={})
+
+
+def test_prepare_of_a_declining_family_refuses_what_decline_declines():
+    """The registry enforces the decline contract itself: a family's prepare step
+    refuses a config its decline hook declines, also without a prepare of its own."""
+    fam = _toy_family(decline=lambda cfg: "windowed" if cfg.get("window") else None)
+    prepare = fam.hook("prepare")
+    assert prepare(_ctx(fam, {})) is None
+    with pytest.raises(NativeConvertRefused, match="does not convert the HF model at /hf: windowed"):
+        prepare(_ctx(fam, {"window": 1}))
+
+
+def test_prepare_of_a_declining_family_runs_its_own_prepare_after_the_check():
+    seen = []
+    fam = _toy_family(
+        decline=lambda cfg: "windowed" if cfg.get("window") else None,
+        prepare=lambda ctx: seen.append(ctx.hf_config) or registry.ConvertPlan(path_suffix="_x"),
+    )
+    assert fam.hook("prepare")(_ctx(fam, {})).path_suffix == "_x" and seen == [{}]
+    with pytest.raises(NativeConvertRefused):
+        fam.hook("prepare")(_ctx(fam, {"window": 1}))
+    assert seen == [{}]  # not run for a declined config
+
+
+@pytest.mark.parametrize(
+    "decline",
+    [
+        lambda cfg: 1 / 0,
+        "no_such_module_xyz:decline",
+        "primus.backends.megatron.checkpoint.native_registry:no_such_function",
+    ],
+    ids=["raises", "import_error", "missing_function"],
+)
+def test_prepare_fails_closed_when_decline_fails(decline):
+    """A decline hook that cannot run (it raises, or its string does not resolve)
+    keeps the family selected and its prepare step refuses with the error."""
+    fam = _toy_family(decline=decline)
+    assert registry.family_for_config({"architectures": ["ToyForCausalLM"]}) is fam
+    with pytest.raises(NativeConvertRefused, match="its decline hook failed"):
+        fam.hook("prepare")(_ctx(fam, {}))
+
+
+def test_decline_hook_refusal_passes_through_prepare_unchanged():
+    """A NativeConvertRefused raised by the decline hook is its decline: detection
+    skips the family with that reason, and prepare re-raises the same exception."""
+    refusal = NativeConvertRefused("not this one")
+
+    def decline(cfg):
+        raise refusal
+
+    fam = _toy_family(decline=decline)
+    assert registry.family_for_config({"architectures": ["ToyForCausalLM"]}) is None
+    with pytest.raises(NativeConvertRefused) as stop:
+        fam.hook("prepare")(_ctx(fam, {}))
+    assert stop.value is refusal
+
+
+@pytest.mark.parametrize("result", [True, 1, {"why": "x"}, "", 0, False])
+def test_decline_hook_result_must_be_none_or_a_reason(result, capsys):
+    """Only None (accept) or a non-empty str (decline) are valid; any other value is a
+    hook error: the family stays selected with a [WARNING] and prepare refuses."""
+    fam = _toy_family(decline=lambda cfg: result)
+    assert registry.family_for_config({"architectures": ["ToyForCausalLM"]}) is fam
+    assert "not None or a non-empty reason string" in capsys.readouterr().err
+    with pytest.raises(NativeConvertRefused, match="its decline hook failed"):
+        fam.hook("prepare")(_ctx(fam, {}))
+
+
+def test_declined_config_does_not_import_the_prepare_module(tmp_path, monkeypatch):
+    """The family's own prepare is resolved (imported) only after decline accepts the
+    config: a declined config refuses with the decline reason, without the import."""
+    mod = tmp_path / "toy_prepare_xyz.py"
+    mod.write_text("def prepare(ctx):\n    return None\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("toy_prepare_xyz", None)
+    fam = _toy_family(
+        decline=lambda cfg: "windowed" if cfg.get("window") else None, prepare="toy_prepare_xyz:prepare"
+    )
+    with pytest.raises(NativeConvertRefused, match="windowed"):
+        fam.hook("prepare")(_ctx(fam, {"window": 1}))
+    assert "toy_prepare_xyz" not in sys.modules
+    assert fam.hook("prepare")(_ctx(fam, {})) is None
+    assert "toy_prepare_xyz" in sys.modules
+    sys.modules.pop("toy_prepare_xyz", None)
+
+
+def test_prepare_that_does_not_load_is_a_refusal_with_the_reason():
+    fam = _toy_family(decline=lambda cfg: None, prepare="no_such_module_xyz:prepare")
+    with pytest.raises(NativeConvertRefused, match="prepare hook 'no_such_module_xyz:prepare' does not load"):
+        fam.hook("prepare")(_ctx(fam, {}))
+
+
+def test_raising_decline_hook_is_refused_by_prepare(tmp_path, capsys, fake_converter):
+    """End to end: a decline hook that raises keeps the family selected with a
+    [WARNING]; its prepare step refuses the config and nothing is converted."""
+    _toy_family(decline=lambda cfg: 1 / 0)
+    hf = _hf(tmp_path, {"architectures": ["ToyForCausalLM"]})
+    assert hook._detect_native_family(hf) == "toy"
+    with pytest.raises(SystemExit) as stop:
+        hook._native_main(hf, {"out": None, "ckpt_format": None}, _experiment())
+    assert stop.value.code == 1
+    err = capsys.readouterr().err
+    assert "decline hook failed" in err and "division by zero" in err
+    assert fake_converter == []
+
+
+def test_decline_hook_that_raises_keeps_the_family_and_warns(tmp_path, capsys):
+    """A decline hook that raises while it runs never crashes detection and never
+    silently changes the route: the family stays selected (its prepare step, which
+    must refuse what decline declines, runs) and the failure is a [WARNING] on stderr."""
+    _toy_family(decline=lambda cfg: cfg["missing_key"])
+    assert registry.family_for_config({"architectures": ["ToyForCausalLM"]}).name == "toy"
+    cfg = {"architectures": ["ToyForCausalLM", "LlamaForCausalLM"]}
+    assert registry.family_for_config(cfg).name == "toy"
+    err = capsys.readouterr().err
+    assert "[WARNING] native converter family 'toy': its decline hook failed" in err
+    assert err.count("decline hook failed") == 1  # reported once
+    assert not any("toy" in k for k in registry._LOAD_ERRORS)
+    other = registry.unknown_model_text(_hf(tmp_path, {"architectures": ["Gemma2ForCausalLM"]}, "gemma"))
+    assert "decline hook failed" not in other and "declines it" not in other
+
+
+def test_model_type_family_that_needs_no_architectures_is_not_blamed(tmp_path, capsys):
+    """unknown_model_text explains only the families detection could select: a
+    model_type family that counts only without architectures is not run."""
+    called = []
+    _toy_family(
+        architectures=(),
+        model_types=("toy2",),
+        model_type_needs_no_architectures=True,
+        decline=lambda cfg: called.append(1) or "nope",
+    )
+    cfg = {"architectures": ["Gemma2ForCausalLM"], "model_type": "toy2"}
+    assert registry.family_for_config(cfg) is None
+    text = registry.unknown_model_text(_hf(tmp_path, cfg))
+    assert "declines it" not in text and called == [] and "declines" not in capsys.readouterr().err
+
+
+def test_unregister_clears_the_reported_declines():
+    _toy_family(decline=lambda cfg: "windowed")
+    registry.family_for_config({"architectures": ["ToyForCausalLM"]})
+    assert any(name == "toy" for name, _ in registry._DECLINE_REPORTED)
+    registry.unregister_native_family("toy")
+    assert not any(name == "toy" for name, _ in registry._DECLINE_REPORTED)
+
+
+def test_unknown_model_text_prints_no_detection_line(tmp_path, capsys):
+    """The forced-native error path (unknown_model_text) states the decline in its own
+    message and prints no detection line (which describes the default route)."""
+    _toy_family(decline=lambda cfg: "windowed")
+    text = registry.unknown_model_text(_hf(tmp_path, {"architectures": ["ToyForCausalLM"]}))
+    assert "Toy LM declines it: windowed" in text
+    assert capsys.readouterr().err == ""
+
+
+def test_decline_line_says_what_native_true_does(capsys):
+    _toy_family(decline=lambda cfg: "windowed")
+    registry.family_for_config({"architectures": ["ToyForCausalLM"]})
+    err = capsys.readouterr().err
+    assert "uses Megatron-Bridge" in err and "stops when native_ckpt_convert: true" in err
+
+
+def test_decline_line_is_printed_on_rank_0_only(capsys, monkeypatch):
+    """As the hook's log_info: other ranks (RANK, else NODE_RANK) print nothing."""
+    _toy_family(decline=lambda cfg: "windowed")
+    monkeypatch.setenv("RANK", "3")
+    assert registry.family_for_config({"architectures": ["ToyForCausalLM"]}) is None
+    assert capsys.readouterr().err == ""
+
+
+def test_decline_reason_is_reported_once(capsys):
+    _toy_family(decline=lambda cfg: "windowed")
+    for _ in range(3):
+        assert registry.family_for_config({"architectures": ["ToyForCausalLM"]}) is None
+    err = capsys.readouterr().err
+    assert err.count("family 'toy' does not convert this HF config: windowed") == 1
+
+
+def test_declined_architecture_falls_through_to_the_next_family():
+    _toy_family(decline=lambda cfg: "not mine")
+    cfg = {"architectures": ["ToyForCausalLM", "LlamaForCausalLM"], "model_type": "toy"}
+    assert registry.family_for_config(cfg).name == "llama"
+
+
+def test_builtins_have_no_decline_hook_and_select_as_before():
+    for name in ("llama", "qwen3", "deepseek"):
+        assert registry.get_family(name).decline is None
+    assert registry.family_for_config({"architectures": ["LlamaForCausalLM"], "window": 8}).name == "llama"
+    assert registry.family_for_config({"model_type": "qwen3_moe"}).name == "qwen3"
 
 
 def test_prepare_experiment_replaces_the_layout_checked(tmp_path, capsys, fake_converter):
