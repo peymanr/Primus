@@ -24,7 +24,7 @@ PRIMUS_ROOT = Path(__file__).resolve().parents[6]
 sys.path.insert(0, str(PRIMUS_ROOT))
 
 from primus.core.config.primus_config import get_module_config, load_primus_config
-from primus.core.utils.arg_utils import parse_cli_overrides
+from primus.core.utils.arg_utils import parse_command_overrides
 
 
 def _is_rank_0() -> bool:
@@ -170,9 +170,7 @@ def read_experiment_checkpoint_settings(config_file: str, argv=None) -> dict:
 
     if argv:
         # the hook group and name (``train posttrain``) come before the overrides
-        tokens = list(argv)
-        first = next((i for i, t in enumerate(tokens) if t.startswith("--") or "=" in t), len(tokens))
-        overrides = parse_cli_overrides(tokens[first:])
+        overrides = parse_command_overrides(argv)
         for name, key in names.items():
             if overrides.get(name) is not None:
                 log_info(f"command line overrides {name}: {settings[key]} -> {overrides[name]}")
