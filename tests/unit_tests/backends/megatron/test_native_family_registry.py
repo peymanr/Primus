@@ -20,6 +20,7 @@ import importlib.util
 import json
 import sys
 import types
+from contextlib import nullcontext as _nullcontext
 from pathlib import Path
 
 import pytest
@@ -149,7 +150,7 @@ def test_builtin_detection_order_and_misses(tmp_path):
     assert hook._detect_native_family(_hf(tmp_path, cfg, "a")) == "llama"
     cfg = {"architectures": ["Unknown"], "model_type": "qwen3_moe"}
     assert hook._detect_native_family(_hf(tmp_path, cfg, "b")) == "qwen3"
-    assert hook._detect_native_family(_hf(tmp_path, {"architectures": ["MistralForCausalLM"]}, "c")) is None
+    assert hook._detect_native_family(_hf(tmp_path, {"architectures": ["Gemma2ForCausalLM"]}, "c")) is None
     assert hook._detect_native_family(str(tmp_path / "no-config")) is None
 
 
@@ -205,16 +206,16 @@ def test_builtin_dispatch_unchanged(tmp_path, monkeypatch, no_megatron_setup):
 
 def test_unregistered_family_name_is_refused_not_sent_to_deepseek(tmp_path, no_megatron_setup):
     hf = _hf(tmp_path, {"architectures": ["LlamaForCausalLM"]})
-    with pytest.raises(ValueError, match=r"no native converter family 'mistral' \(supported: Qwen3"):
-        hook.native_convert_checkpoint(hf, "out", {"family": "mistral"})
+    with pytest.raises(ValueError, match=r"no native converter family 'gemma2' \(supported: Qwen3"):
+        hook.native_convert_checkpoint(hf, "out", {"family": "gemma2"})
 
 
 def test_unknown_model_message_lists_registered_families(tmp_path, monkeypatch, capsys):
     _toy_family()
-    hf = _hf(tmp_path, {"architectures": ["MistralForCausalLM"]})
+    hf = _hf(tmp_path, {"architectures": ["Gemma2ForCausalLM"]})
     with pytest.raises(ValueError) as e:
         hook.native_convert_checkpoint(hf, "out", {})
-    assert "Qwen3 dense/MoE, DeepSeek-V2/V3, Llama 2/3/3.1, Toy LM" in str(e.value)
+    assert "Qwen3 dense/MoE, DeepSeek-V2/V3, Llama 2/3/3.1" in str(e.value) and "Toy LM" in str(e.value)
 
     monkeypatch.setattr(hook, "get_checkpoint_config", lambda config: (hf, None))
     monkeypatch.setattr(
@@ -227,7 +228,7 @@ def test_unknown_model_message_lists_registered_families(tmp_path, monkeypatch, 
         hook.main()
     err = capsys.readouterr().err
     assert f"no native converter matches the HF model at {hf}" in err
-    assert "Llama 2/3/3.1, Toy LM" in err and "native_ckpt_convert: false" in err
+    assert "Llama 2/3/3.1" in err and "Toy LM" in err and "native_ckpt_convert: false" in err
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +455,64 @@ def test_prepare_refusal_exits_before_conversion(tmp_path, capsys, fake_converte
         )
     assert fake_converter == []
     assert "does not support" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("enabled,expected", [(None, "bridge"), (True, "native"), (False, "bridge")])
+def test_decline_sends_unset_default_to_bridge(tmp_path, monkeypatch, enabled, expected):
+    """A family's decline hook: with native_ckpt_convert unset, a declined config takes
+    the Megatron-Bridge path (as a config no family selects); true forces native."""
+    _toy_family(decline=lambda cfg: "windowed" if cfg.get("window") else None)
+    hf = _hf(tmp_path, {"architectures": ["ToyForCausalLM"], "window": 8})
+    assert registry.declined_reason(registry.get_family("toy"), hf) == "windowed"
+    monkeypatch.setattr(hook, "get_checkpoint_config", lambda f: (hf, None))
+    monkeypatch.setattr(hook, "read_native_opts", lambda f: {"enabled": enabled, "dtype": None, "out": None})
+    monkeypatch.setattr(hook, "read_experiment_checkpoint_settings", lambda f: {})
+    taken = []
+    monkeypatch.setattr(hook, "_native_main", lambda *a, **k: taken.append("native"))
+
+    def log_info(msg):
+        if "Megatron-Bridge conversion path" in msg:
+            taken.append("bridge")
+            raise SystemExit(0)
+
+    monkeypatch.setattr(hook, "log_info", log_info)
+    monkeypatch.setattr(sys, "argv", ["hook", "--config", "/x.yaml"])
+    with pytest.raises(SystemExit) if expected == "bridge" else _nullcontext():
+        hook.main()
+    assert taken == [expected]
+
+
+def test_decline_none_or_absent_keeps_native(tmp_path):
+    hf = _hf(tmp_path, {"architectures": ["ToyForCausalLM"]})
+    _toy_family(decline=lambda cfg: None)
+    assert registry.declined_reason(registry.get_family("toy"), hf) is None
+    assert hook._native_declined_reason(hf, "toy") is None
+    assert hook._native_declined_reason(hf, None) is None
+    for name in ("llama", "qwen3", "deepseek"):  # built-ins have no decline hook
+        assert registry.get_family(name).decline is None
+        assert hook._native_declined_reason(hf, name) is None
+
+
+@pytest.mark.parametrize(
+    "enabled,decline,expected",
+    [
+        (None, None, (True, "toy", None)),
+        (None, "windowed", (False, "toy", "windowed")),
+        (True, "windowed", (True, "toy", None)),
+        (False, None, (False, "toy", None)),
+    ],
+)
+def test_use_native_route(tmp_path, enabled, decline, expected):
+    """The one routing rule main() and 00_install_requirements.sh share."""
+    _toy_family(decline=lambda cfg: decline)
+    hf = _hf(tmp_path, {"architectures": ["ToyForCausalLM"]})
+    assert hook._use_native({"enabled": enabled}, hf) == expected
+
+
+def test_use_native_unknown_family(tmp_path):
+    hf = _hf(tmp_path, {"architectures": ["NoSuchForCausalLM"], "model_type": "nosuch"})
+    assert hook._use_native({"enabled": None}, hf) == (False, None, None)
+    assert hook._use_native({"enabled": True}, hf) == (True, None, None)
 
 
 def test_prepare_experiment_replaces_the_layout_checked(tmp_path, capsys, fake_converter):
