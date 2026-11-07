@@ -170,6 +170,12 @@ class NativeFamily:
     * ``wait(megatron_path, done_file, lock_file, node_rank)``: how a node
       other than node 0 waits for the conversion; default: the hook's
       ``wait_for_conversion``.
+    * ``decline(cfg) -> str | None``: a reason (or None) why the family does
+      not convert this HF ``config.json`` dict by default. With
+      ``native_ckpt_convert`` unset, a declined config takes the Megatron-Bridge
+      path, as a config no family selects does; with ``native_ckpt_convert:
+      true`` the family's ``prepare`` step decides. It runs before any
+      conversion option is read, so it must stay light (config only).
 
     Hooks are callables or ``"module:function"`` strings (imported on use).
     """
@@ -185,12 +191,13 @@ class NativeFamily:
     dtype_from_config: Hook = None
     prepare: Hook = None
     wait: Hook = None
+    decline: Hook = None
 
     def converter_module(self):
         return importlib.import_module(self.converter)
 
     def hook(self, which: str) -> Callable | None:
-        """The ``which`` hook (``prepare`` / ``wait`` / ``dtype_from_config``) as a callable."""
+        """The ``which`` hook (``prepare`` / ``wait`` / ``dtype_from_config`` / ``decline``) as a callable."""
         return resolve_hook(getattr(self, which))
 
 
@@ -346,6 +353,19 @@ def detect_family(hf_path: str) -> NativeFamily | None:
     """The family of the HF model directory ``hf_path`` (its ``config.json``), or None."""
     cfg = read_config(hf_path)
     return None if cfg is None else family_for_config(cfg)
+
+
+def declined_reason(family: NativeFamily, hf_path: str) -> str | None:
+    """Why ``family`` declines to convert the HF model at ``hf_path`` by default
+    (its ``decline`` hook on the ``config.json``), or None: no hook, no config, or
+    the family converts it."""
+    decline = family.hook("decline")
+    if decline is None:
+        return None
+    cfg = read_config(hf_path)
+    if cfg is None:
+        return None
+    return decline(cfg) or None
 
 
 def dtype_name(raw: str) -> str | None:

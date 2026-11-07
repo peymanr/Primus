@@ -275,6 +275,30 @@ def _detect_native_family(hf_path: str) -> str | None:
     return family.name if family is not None else None
 
 
+def _native_declined_reason(hf_path: str, family: str | None) -> str | None:
+    """Why the registered ``family`` declines the HF model at ``hf_path`` by default
+    (its ``decline`` hook), or None."""
+    if family is None:
+        return None
+    registry = _registry()
+    return registry.declined_reason(registry.get_family(family), hf_path)
+
+
+def _use_native(native_opts: dict, hf_path: str) -> tuple[bool, str | None, str | None]:
+    """The conversion route: ``(use_native, family, declined_reason)``.
+
+    ``native_ckpt_convert: true`` forces native, ``false`` forces Megatron-Bridge;
+    unset, native is used when a registered family matches ``hf_path`` and does not
+    decline it. Used by ``main`` and by 00_install_requirements.sh."""
+    native_family = _detect_native_family(hf_path)
+    if native_opts["enabled"] is True:
+        return True, native_family, None
+    if native_opts["enabled"] is False:
+        return False, native_family, None
+    declined = _native_declined_reason(hf_path, native_family)
+    return native_family is not None and not declined, native_family, declined
+
+
 def _native_dtype_from_config(hf_path: str, override: str | None, family: str | None = None) -> str:
     """``override``, else the HF config's dtype (``bf16`` / ``fp16`` / ``fp32``; ``bf16`` if unknown)."""
     registry = _registry()
@@ -666,8 +690,9 @@ def main():
 
     # ---- Choose conversion backend --------------------------------------
     # Native (bridge-free) conversion is the DEFAULT for the registered families
-    # (native_registry). ``native_ckpt_convert: false`` forces the legacy
-    # Megatron-Bridge path; ``native_ckpt_convert: true`` forces native.
+    # (native_registry), unless the family declines the config (its ``decline``
+    # hook). ``native_ckpt_convert: false`` forces the legacy Megatron-Bridge
+    # path; ``native_ckpt_convert: true`` forces native.
     native_opts = read_native_opts(config_file)
     native_family = _detect_native_family(hf_path)
     if native_opts["enabled"] is True:
