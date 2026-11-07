@@ -67,7 +67,11 @@ _FAKE_CONVERTER = "native_registry_test_fake_converter"
 
 @pytest.fixture(autouse=True)
 def isolated_registry(monkeypatch):
-    """Each test sees the built-ins (plus what it registers); the registry is restored after."""
+    """Each test sees the built-ins and the discovered families (plus what it registers);
+    the registry is restored after. Discovery runs before the snapshot: a family module
+    registers only on its first import, so restoring a pre-discovery snapshot would drop
+    it for the rest of the session."""
+    registry.load_family_modules()
     saved = (dict(registry._FAMILIES), dict(registry._NAMES), dict(registry._LOAD_ERRORS), registry._loaded)
     yield
     registry._FAMILIES.clear()
@@ -149,7 +153,7 @@ def test_builtin_detection_order_and_misses(tmp_path):
     assert hook._detect_native_family(_hf(tmp_path, cfg, "a")) == "llama"
     cfg = {"architectures": ["Unknown"], "model_type": "qwen3_moe"}
     assert hook._detect_native_family(_hf(tmp_path, cfg, "b")) == "qwen3"
-    assert hook._detect_native_family(_hf(tmp_path, {"architectures": ["MistralForCausalLM"]}, "c")) is None
+    assert hook._detect_native_family(_hf(tmp_path, {"architectures": ["NoSuchForCausalLM"]}, "c")) is None
     assert hook._detect_native_family(str(tmp_path / "no-config")) is None
 
 
@@ -205,16 +209,21 @@ def test_builtin_dispatch_unchanged(tmp_path, monkeypatch, no_megatron_setup):
 
 def test_unregistered_family_name_is_refused_not_sent_to_deepseek(tmp_path, no_megatron_setup):
     hf = _hf(tmp_path, {"architectures": ["LlamaForCausalLM"]})
-    with pytest.raises(ValueError, match=r"no native converter family 'mistral' \(supported: Qwen3"):
-        hook.native_convert_checkpoint(hf, "out", {"family": "mistral"})
+    with pytest.raises(ValueError, match=r"no native converter family 'no_such_family' \(supported: Qwen3"):
+        hook.native_convert_checkpoint(hf, "out", {"family": "no_such_family"})
 
 
 def test_unknown_model_message_lists_registered_families(tmp_path, monkeypatch, capsys):
     _toy_family()
-    hf = _hf(tmp_path, {"architectures": ["MistralForCausalLM"]})
+    hf = _hf(tmp_path, {"architectures": ["NoSuchModelForCausalLM"]})
     with pytest.raises(ValueError) as e:
         hook.native_convert_checkpoint(hf, "out", {})
-    assert "Qwen3 dense/MoE, DeepSeek-V2/V3, Llama 2/3/3.1, Toy LM" in str(e.value)
+    # Built-ins first, then the families of native_families/ (discovered), then Toy LM.
+    # A port adds its family module there, so the exact list grows; this checks its shape.
+    supported = registry.supported_text()
+    assert supported in str(e.value)
+    assert supported.startswith("supported: Qwen3 dense/MoE, DeepSeek-V2/V3, Llama 2/3/3.1, ")
+    assert supported.endswith(", Toy LM")
 
     monkeypatch.setattr(hook, "get_checkpoint_config", lambda config: (hf, None))
     monkeypatch.setattr(
@@ -227,7 +236,7 @@ def test_unknown_model_message_lists_registered_families(tmp_path, monkeypatch, 
         hook.main()
     err = capsys.readouterr().err
     assert f"no native converter matches the HF model at {hf}" in err
-    assert "Llama 2/3/3.1, Toy LM" in err and "native_ckpt_convert: false" in err
+    assert registry.supported_text() in err and "native_ckpt_convert: false" in err
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +301,54 @@ def test_family_modules_are_discovered(tmp_path, monkeypatch, capsys):
     finally:
         for name in ("fams_pkg", "fams_pkg.toy", "fams_pkg.broken"):
             sys.modules.pop(name, None)
+
+
+@pytest.fixture(scope="class")
+def fresh_family_package(tmp_path_factory):
+    """A family package not yet imported, as at the start of a session: its module
+    registers 'Keep LM' on its first import only. Restores the registry after the class."""
+    root = tmp_path_factory.mktemp("keep_fams")
+    pkg = root / "keep_fams_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "keep.py").write_text(
+        "from primus.backends.megatron.checkpoint.native_registry import NativeFamily, register_native_family\n"
+        "register_native_family(NativeFamily(name='keep', label='Keep LM', converter='m',"
+        " architectures=('KeepForCausalLM',)))\n"
+    )
+    saved = (
+        registry.FAMILY_PACKAGE,
+        dict(registry._FAMILIES),
+        dict(registry._NAMES),
+        dict(registry._LOAD_ERRORS),
+        registry._loaded,
+    )
+    sys.path.insert(0, str(root))
+    registry.FAMILY_PACKAGE = "keep_fams_pkg"
+    registry._loaded = False  # discovery not run yet (runs before isolated_registry: class scope)
+    yield
+    sys.path.remove(str(root))
+    for name in ("keep_fams_pkg", "keep_fams_pkg.keep"):
+        sys.modules.pop(name, None)
+    registry.FAMILY_PACKAGE = saved[0]
+    for live, old in zip((registry._FAMILIES, registry._NAMES, registry._LOAD_ERRORS), saved[1:4]):
+        live.clear()
+        live.update(old)
+    registry._loaded = saved[4]
+
+
+@pytest.mark.usefixtures("fresh_family_package")
+class TestDiscoveredFamilySurvivesIsolation:
+    """isolated_registry must snapshot after discovery: a family module registers only on
+    its first import, so a pre-discovery snapshot would drop it after the first test."""
+
+    def test_first_test_discovers_the_family(self):
+        assert "Keep LM" in registry.supported_text()
+        assert registry.family_for_config({"architectures": ["KeepForCausalLM"]}).name == "keep"
+
+    def test_family_still_listed_in_a_later_test(self):
+        assert "Keep LM" in registry.supported_text()
+        assert registry.family_for_config({"architectures": ["KeepForCausalLM"]}).name == "keep"
 
 
 def test_shipped_family_package_imports():
