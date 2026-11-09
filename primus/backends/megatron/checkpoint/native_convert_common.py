@@ -29,6 +29,7 @@ Bridge-free guarantee: this module (and its callers) import ONLY
 a hard guard asserts it never leaked into ``sys.modules``.
 """
 
+import errno
 import json
 import os
 import shutil
@@ -296,7 +297,8 @@ def load_validate_save(model, sd, consumed, store, margs, save_dir, log):
     (conversion hook) fails loudly instead of writing a silently-wrong ckpt, and
     before writing anything if ``save_dir`` has less free space than the checkpoint
     needs (``check_free_space``). A write that fails anyway is re-raised as a
-    ``RuntimeError`` that names the directory and its free space.
+    ``RuntimeError`` that names the directory, and its free space when the write
+    ran out of it.
     """
     missing, unexpected = model.load_state_dict(sd, strict=False)
     missing_non_extra = [k for k in missing if "_extra_state" not in k]
@@ -345,13 +347,43 @@ def load_validate_save(model, sd, consumed, store, margs, save_dir, log):
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as e:
-        raise RuntimeError(
-            f"writing the {ckpt_format} checkpoint to {save_dir} failed ({e!r}); "
-            f"{_gib(shutil.disk_usage(save_dir).free)} free there now. A write that fails part-way "
-            "(most often a full disk) is reported by torch as '[enforce fail at inline_container.cc] "
-            "unexpected pos <n> vs <m>'. Set native_ckpt_out (or DATA_PATH) to a volume with room."
-        ) from e
+        message = f"writing the {ckpt_format} checkpoint to {save_dir} failed ({e!r})"
+        if _ran_out_of_space(e):
+            message += (
+                f"; most likely the disk filled up ({_free_space_text(save_dir)}). "
+                "Set native_ckpt_out (or DATA_PATH) to a volume with room."
+            )
+        raise RuntimeError(message) from e
     log(f"DONE. Converted {ckpt_format} checkpoint at: {save_dir}")
+
+
+# How a write that runs out of space is reported: torch.save loses the OSError and raises
+# "[enforce fail at inline_container.cc] unexpected pos <n> vs <m>" (see check_free_space);
+# newer torch and other writers raise the OSError.
+_OUT_OF_SPACE_TEXT = ("unexpected pos", "No space left on device", "Disk quota exceeded")
+
+
+def _ran_out_of_space(exc: BaseException) -> bool:
+    """Whether ``exc``, or an exception it was raised from, is a write that ran out of space.
+
+    A DCP ``CheckpointException`` includes the errors of its ranks in its text.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+            return True
+        if any(text in str(exc) for text in _OUT_OF_SPACE_TEXT):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _free_space_text(path: str) -> str:
+    try:
+        return f"{_gib(shutil.disk_usage(path).free)} free there now"
+    except OSError as e:
+        return f"its free space could not be read: {e}"
 
 
 # Per-tensor overhead of the files a save writes: each tensor is its own small zip
@@ -388,7 +420,9 @@ def check_free_space(model, save_dir: str, log=print) -> None:
     write of a tensor's data as ``[enforce fail at inline_container.cc] unexpected pos
     <n> vs <m>`` (the ``OSError`` behind it is lost), after minutes of writing, and a
     retry fails the same way. The converted checkpoint of a large model is hundreds of
-    GiB (bf16), more than a node's local ``/tmp`` often has.
+    GiB (bf16), more than a node's local ``/tmp`` often has. The refusal names the
+    interrupted saves set aside in ``save_dir`` (``set_aside_interrupted_release``),
+    which take space there.
     """
     need = checkpoint_bytes(model)
     os.makedirs(save_dir, exist_ok=True)
@@ -397,8 +431,31 @@ def check_free_space(model, save_dir: str, log=print) -> None:
     if free < need:
         raise RuntimeError(
             f"not enough disk space for the converted checkpoint in {save_dir}: needs ~{_gib(need)}, "
-            f"{_gib(free)} free. Set native_ckpt_out (or DATA_PATH) to a volume with room."
+            f"{_gib(free)} free.{_set_aside_text(save_dir)} Set native_ckpt_out (or DATA_PATH) to a "
+            "volume with room."
         )
+
+
+def _set_aside_text(save_dir: str) -> str:
+    aside = sorted(n for n in os.listdir(save_dir) if n.startswith("release.incomplete-"))
+    if not aside:
+        return ""
+    size = sum(_dir_bytes(os.path.join(save_dir, n)) for n in aside)
+    return (
+        f" Interrupted saves set aside there use {_gib(size)} ({', '.join(aside)}); "
+        "deleting them frees that space."
+    )
+
+
+def _dir_bytes(path: str) -> int:
+    total = 0
+    for root, _, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
 
 
 def read_hf_config(hf_dir: str) -> dict:
@@ -442,14 +499,20 @@ def set_aside_interrupted_release(save_dir: str, log=print) -> None:
     Megatron writes the tracker file after the checkpoint, so a ``release/``
     without one is what an interrupted save leaves: it is moved to
     ``release.incomplete-<unix time>`` and the conversion runs again. A
-    ``release/`` with a tracker file beside it is refused.
+    ``release/`` with a tracker file beside it is refused, whatever the file
+    holds (``release``, an iteration, or nothing Megatron can read): only a
+    missing tracker shows an interrupted save.
     """
     release_dir = os.path.join(save_dir, "release")
     if not os.path.exists(release_dir):
         return
-    if tracked_ckpt_dir(save_dir) is not None:
+    tracker = os.path.join(save_dir, TRACKER_FILENAME)
+    if os.path.exists(tracker):
+        with open(tracker, errors="replace") as f:
+            holds = f.read().strip()[:40]
         raise RuntimeError(
-            f"{save_dir} already has a 'release' directory; remove it or convert into an empty directory."
+            f"{save_dir} already has a 'release' directory, and a tracker file holding {holds!r}; "
+            "remove both or convert into an empty directory."
         )
     aside = f"{release_dir}.incomplete-{int(time.time())}"
     os.rename(release_dir, aside)

@@ -143,13 +143,19 @@ def test_legacy_torch_save_keeps_per_rank_layout(tmp_path, fake_save_checkpoint)
     assert common.saved_ckpt_format(str(out)) == "torch"
 
 
-def test_torch_dist_save_refuses_a_finished_release_dir(tmp_path, fake_save_checkpoint):
+@pytest.mark.parametrize("tracker", ["release", "1", "", "garbage"])
+def test_torch_dist_save_refuses_a_release_dir_beside_any_tracker(tmp_path, fake_save_checkpoint, tracker):
+    """Only a missing tracker file shows an interrupted save: a ``release/`` beside one
+    stays where it is, whatever the tracker holds."""
     state, calls = fake_save_checkpoint
     _write_torch_dist(tmp_path / "out" / "release")
-    (tmp_path / "out" / common.TRACKER_FILENAME).write_text("release")
-    with pytest.raises(RuntimeError, match="already has a 'release' directory"):
+    (tmp_path / "out" / common.TRACKER_FILENAME).write_text(tracker)
+    with pytest.raises(RuntimeError, match="already has a 'release' directory") as err:
         _save(tmp_path, state, "torch_dist")
+    assert f"tracker file holding {tracker!r}" in str(err.value)
     assert calls == []
+    assert (tmp_path / "out" / "release" / "metadata.json").is_file()
+    assert not list((tmp_path / "out").glob("release.incomplete-*"))
 
 
 def test_torch_dist_save_sets_aside_an_interrupted_release_dir(tmp_path, fake_save_checkpoint):
@@ -234,6 +240,25 @@ def test_save_refused_before_writing_when_disk_too_small(tmp_path, fake_save_che
     assert not (tmp_path / "out" / "iter_0000001").exists()
 
 
+def test_space_refusal_names_the_interrupted_saves_set_aside(tmp_path, fake_save_checkpoint, monkeypatch):
+    """Each interrupted save is kept as ``release.incomplete-<time>``; a retry without room
+    is told how much of the space they hold."""
+    state, calls = fake_save_checkpoint
+    for stamp in ("1700000000", "1700000100"):
+        aside = tmp_path / "out" / f"release.incomplete-{stamp}"
+        aside.mkdir(parents=True)
+        with open(aside / "__0_0.distcp", "wb") as f:
+            f.truncate(3 * 2**29)  # 1.5 GiB, sparse
+    _free_space(monkeypatch, free=32)
+    with pytest.raises(RuntimeError, match="not enough disk space") as err:
+        _save(tmp_path, state, "torch_dist")
+    assert calls == []
+    assert (
+        "Interrupted saves set aside there use 3.0 GiB "
+        "(release.incomplete-1700000000, release.incomplete-1700000100); deleting them frees that space"
+    ) in str(err.value)
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch_dist", "torch"])
 def test_failed_write_names_directory_and_free_space(
     tmp_path, fake_save_checkpoint, monkeypatch, ckpt_format
@@ -253,6 +278,84 @@ def test_failed_write_names_directory_and_free_space(
         _save(tmp_path, state, ckpt_format)
     assert str(tmp_path / "out") in str(err.value)
     assert err.value.__cause__ is not None
+
+
+def _failing_save(monkeypatch, exc):
+    def save_checkpoint(
+        iteration, models, optimizer, scheduler, num_floating_point_operations_so_far, release=False
+    ):
+        raise exc
+
+    monkeypatch.setattr(sys.modules["megatron.training.checkpointing"], "save_checkpoint", save_checkpoint)
+
+
+class _CheckpointException(BaseException):
+    """Like torch DCP's CheckpointException: a BaseException whose text holds its ranks' errors."""
+
+
+def _raised_from(exc, cause):
+    exc.__cause__ = cause
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError(errno.ENOSPC, "No space left on device"),
+        OSError(errno.EDQUOT, "Disk quota exceeded"),
+        _CheckpointException("ranks:dict_keys([0])\nOSError: [Errno 28] No space left on device"),
+        _raised_from(RuntimeError("worker failed"), OSError(errno.ENOSPC, "No space left on device")),
+    ],
+    ids=["enospc", "quota", "dcp", "chained"],
+)
+def test_failed_write_out_of_space_says_so(tmp_path, fake_save_checkpoint, monkeypatch, exc):
+    state, _ = fake_save_checkpoint
+    _failing_save(monkeypatch, exc)
+    with pytest.raises(RuntimeError, match="most likely the disk filled up") as err:
+        _save(tmp_path, state, "torch_dist")
+    assert "native_ckpt_out" in str(err.value)
+    assert err.value.__cause__ is exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ValueError("no sharded tensor for decoder.layers.0.mlp.linear_fc1.weight"),
+        _CheckpointException("ranks:dict_keys([0])\nPermissionError: [Errno 13] Permission denied"),
+    ],
+    ids=["value-error", "dcp-permission"],
+)
+def test_failed_write_for_another_reason_gets_no_disk_advice(
+    tmp_path, fake_save_checkpoint, monkeypatch, exc
+):
+    state, _ = fake_save_checkpoint
+    _failing_save(monkeypatch, exc)
+    with pytest.raises(RuntimeError) as err:
+        _save(tmp_path, state, "torch_dist")
+    message = str(err.value)
+    assert str(tmp_path / "out") in message and repr(exc) in message
+    assert "filled up" not in message and "native_ckpt_out" not in message
+    assert err.value.__cause__ is exc
+
+
+def test_failed_write_keeps_its_error_when_free_space_cannot_be_read(
+    tmp_path, fake_save_checkpoint, monkeypatch
+):
+    state, _ = fake_save_checkpoint
+    exc = OSError(errno.ENOSPC, "No space left on device")
+    _failing_save(monkeypatch, exc)
+    reads = []
+
+    def disk_usage(path):  # room for the check before the save, then the directory is gone
+        reads.append(path)
+        if len(reads) > 1:
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+        return SimpleNamespace(total=1 << 40, used=0, free=1 << 40)
+
+    monkeypatch.setattr(common.shutil, "disk_usage", disk_usage)
+    with pytest.raises(RuntimeError, match="free space could not be read") as err:
+        _save(tmp_path, state, "torch_dist")
+    assert err.value.__cause__ is exc
 
 
 def test_checkpoint_bytes_counts_each_tensor_once():
@@ -471,6 +574,25 @@ def test_default_output_path_includes_format(
     assert [c["ckpt_format"] for c in fake_convert] == [ckpt_format]
     assert _emitted(capsys) == {"extra.pretrained_checkpoint": str(expected), "extra.finetune": "true"}
     assert common.saved_ckpt_format(str(expected)) == ckpt_format
+
+
+@pytest.mark.parametrize("ckpt_format", ["torch_dist", "torch"])
+def test_conversion_points_out_one_at_the_earlier_default_path(
+    tmp_path, monkeypatch, capsys, hf_llama, fake_convert, ckpt_format
+):
+    """Earlier versions converted into ``<name>_native`` (legacy torch); a conversion into
+    the new default path says that one is left unused, and how a torch run reuses it."""
+    monkeypatch.setenv("DATA_PATH", str(tmp_path / "data"))
+    earlier = tmp_path / "data" / "megatron_checkpoints" / "tiny-llama_native"
+    _write_torch(earlier / "iter_0000001")
+    (earlier / common.TRACKER_FILENAME).write_text("1")
+
+    hook._native_main(str(hf_llama), {"out": None, "ckpt_format": None}, _experiment(ckpt_format=ckpt_format))
+
+    out = capsys.readouterr().out
+    assert f"[WARNING] {earlier} holds a conversion" in out
+    assert (f"set native_ckpt_out: {earlier}." in out) == (ckpt_format == "torch")
+    assert [c["ckpt_format"] for c in fake_convert] == [ckpt_format]
 
 
 def test_existing_checkpoint_of_same_format_is_reused(tmp_path, monkeypatch, capsys, hf_llama, fake_convert):
